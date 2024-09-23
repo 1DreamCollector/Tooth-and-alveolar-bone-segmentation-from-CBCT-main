@@ -1,0 +1,132 @@
+import os
+import sys
+import argparse
+import torch
+import math
+import numpy as np
+import nibabel as nib
+import torch.nn.functional as F
+from skimage import morphology
+from scipy import ndimage
+from skimage import measure
+from scipy.ndimage import gaussian_filter
+from skimage.morphology import skeletonize_3d
+from networks.vnet_ins_seg import VNet_singleTooth
+
+
+
+
+def tooth_seg(net_seg, image, multi_skeleton, patch_size):
+    w, h, d = image.shape
+
+    # if the size of image is less than patch_size, then padding it
+    add_pad = False
+    if w < patch_size[0]:           #(96,96,176)
+        w_pad = patch_size[0]-w
+        add_pad = True
+    else:
+        w_pad = 0
+    if h < patch_size[1]:
+        h_pad = patch_size[1]-h
+        add_pad = True
+    else:
+        h_pad = 0
+    if d < patch_size[2]:
+        d_pad = patch_size[2]-d
+        add_pad = True
+    else:
+        d_pad = 0
+    wl_pad, wr_pad = w_pad//2, w_pad-w_pad//2
+    hl_pad, hr_pad = h_pad//2, h_pad-h_pad//2
+    dl_pad, dr_pad = d_pad//2, d_pad-d_pad//2
+    if add_pad:
+        image = np.pad(image, [(wl_pad, wr_pad), (hl_pad, hr_pad), (dl_pad, dr_pad)], mode='constant', constant_values=0)
+    #以上的代码就是为了根据输入尺寸看看合不合适，是不是需要插值填充
+    ww,hh,dd = image.shape
+    
+    # crop the patch size from original image
+    crop_size = patch_size
+    image_list, skeleton_list, crop_coord_min_list = [], [], []
+    teeth_ids = np.unique(multi_skeleton)
+    for i in range(len(teeth_ids)):
+        tooth_id = teeth_ids[i]
+        if tooth_id == 0:
+            continue
+        #找到单颗牙齿骨架的边界范围
+        coord = np.nonzero((multi_skeleton == tooth_id))
+        meanx = int(np.mean(coord[0]))
+        meany = int(np.mean(coord[1]))
+        meanz = int(np.mean(coord[2]))
+        #骨架的中点
+        mean_coord = (meanx, meany, meanz)
+        # generate the crop coords
+        crop_coord_min = mean_coord - crop_size/2
+        np.clip(crop_coord_min, (0, 0, 0), image.shape - crop_size, out = crop_coord_min)
+        crop_coord_min = crop_coord_min.astype(int)
+        #裁剪的单颗骨架
+        crop_skeleton = (multi_skeleton[crop_coord_min[0]:(crop_coord_min[0]+crop_size[0]), crop_coord_min[1]:(crop_coord_min[1]+crop_size[1]), crop_coord_min[2]:(crop_coord_min[2]+crop_size[2])] == tooth_id).astype(np.uint8)
+        crop_skeleton = skeletonize_3d(crop_skeleton)
+        #把骨架膨胀一下
+        crop_skeleton = ndimage.grey_dilation(crop_skeleton, size= (3, 3, 3))
+        crop_skeleton = morphology.remove_small_objects(crop_skeleton.astype(bool), min_size=50, connectivity=1)
+        crop_skeleton = gaussian_filter(crop_skeleton.astype(float), sigma=2)
+        #把每颗裁剪的原始ct图像和骨架都存下来
+        image_list.append(image[crop_coord_min[0]:(crop_coord_min[0]+crop_size[0]), crop_coord_min[1]:(crop_coord_min[1]+crop_size[1]), crop_coord_min[2]:(crop_coord_min[2]+crop_size[2])])
+        skeleton_list.append(crop_skeleton)
+        crop_coord_min_list.append(crop_coord_min)
+    patches_coord_min = np.asarray(crop_coord_min_list)
+    image_patches = np.asarray(image_list)
+    skeleton_patches = np.asarray(skeleton_list)
+
+    image_patches = torch.from_numpy(image_patches[:, None, :, :, :]).float().cuda(1)
+    skeleton_patches = torch.from_numpy(skeleton_patches[:, None, :, :, :]).float().cuda(1)
+    with torch.no_grad():
+        #把28颗牙齿分三批送进去推理
+        seg_patches_1, bd_patches_1, kp_patches_1 = net_seg(image_patches[:10, :, :, :, :], skeleton_patches[:10, :, :, :, :])
+        seg_patches_2, bd_patches_2, kp_patches_2 = net_seg(image_patches[10:20, :, :, :, :], skeleton_patches[10:20, :, :, :, :])
+        seg_patches_3, bd_patches_3, kp_patches_3 = net_seg(image_patches[20:, :, :, :, :], skeleton_patches[20:, :, :, :, :])
+        seg_patches = torch.cat((seg_patches_1, seg_patches_2), 0)
+        seg_patches = torch.cat((seg_patches, seg_patches_3), 0)
+    seg_patches = F.softmax(seg_patches, dim=1)
+    seg_patches = torch.argmax(seg_patches, dim = 1)
+    seg_patches = seg_patches.cpu().data.numpy()
+    w2, h2, d2 = image.shape
+    count = 0
+    image_label = np.zeros((w2, h2, d2), dtype=int)
+    image_vote_flag = np.zeros((w2, h2, d2), dtype=int)
+    for crop_i in range(patches_coord_min.shape[0]):
+        # label patch
+        #按索引根据检测裁剪区域的连通性分配标签
+        labels, num = measure.label(seg_patches[crop_i, :, :, :], connectivity=2, background=0, return_num=True)
+        #连通区域如果大于1，那么应该保留最大的连通区域,
+        if num > 1:
+            max_num = -1e10
+            for lab_id in range(1, num+1):
+                if np.sum(labels == lab_id) > max_num:
+                    max_num = np.sum(labels == lab_id)
+                    true_id = lab_id
+        #并给最大连通区域的分配标签
+            seg_patches[crop_i, :, :, :] = (labels == true_id)
+        coord = np.array(np.nonzero((seg_patches[crop_i, :, :, :] == 1)))
+        #获取最大连通区域的坐标
+        coord[0] = coord[0] + patches_coord_min[crop_i, 0]
+        coord[1] = coord[1] + patches_coord_min[crop_i, 1]
+        coord[2] = coord[2] + patches_coord_min[crop_i, 2]
+        #
+        image_vote_flag[coord[0], coord[1], coord[2]] = 1
+        if np.sum((image_vote_flag > 0.5) * (image_label > 0.5)) > 2000:
+            image_vote_flag[coord[0], coord[1], coord[2]] = 0
+            continue
+        count = count + 1
+        image_label[coord[0], coord[1], coord[2]] = count
+        image_vote_flag[coord[0], coord[1], coord[2]] = 0
+
+    if add_pad:
+        image_label = image_label[wl_pad:wl_pad+w,hl_pad:hl_pad+h,dl_pad:dl_pad+d]
+    return image_label
+
+def ins_tooth_seg(ins_net, image, centroids, patch_size):
+    #net = load_model()
+    label_map = tooth_seg(ins_net, image, centroids, patch_size)
+    #del net
+    return label_map
