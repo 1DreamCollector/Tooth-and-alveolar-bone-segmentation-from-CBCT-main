@@ -3,8 +3,8 @@
 
 牙齿实例分割的结果：
 
-![1727060522822](C:\Users\17159\AppData\Roaming\Typora\typora-user-images\1727060522822.png)
+![Alt text](https://github.com/1DreamCollector/Tooth-and-alveolar-bone-segmentation-from-CBCT-main/blob/main/Tooth-and-alveolar-bone-segmentation-from-CBCT-main/pic/1.png)
 
 
 
-![1727060562203](C:\Users\17159\AppData\Roaming\Typora\typora-user-images\1727060562203.png)
+![Alt text](https://github.com/1DreamCollector/Tooth-and-alveolar-bone-segmentation-from-CBCT-main/blob/main/Tooth-and-alveolar-bone-segmentation-from-CBCT-main/pic/2.png)
